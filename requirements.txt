@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+langgraph
+langchain
+langchain-anthropic
+langchain-community
+anthropic
+sqlalchemy
+gradio
+python-dotenv
+pydantic
+aiosqlite
+tabulate
+httpx

@@ -1,0 +1,30 @@
+# Environment
+.env
+
+# Generated databases (run seed scripts to regenerate)
+business.db
+enterprise.db
+query_cache.db
+token_log.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+_smoke_test.py
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
