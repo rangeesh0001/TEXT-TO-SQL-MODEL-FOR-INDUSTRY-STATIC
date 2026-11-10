@@ -1,12 +1,12 @@
 # Production Text-to-SQL AI Agent 🤖
 
-A **production-grade Text-to-SQL AI agent** built with **LangGraph**, **Claude Haiku**, and **FastAPI**.
+A **production-grade Text-to-SQL AI agent** built with **LangGraph**, **Google Gemini**, and **FastAPI**.
 Goes far beyond demo agents — handles real enterprise schemas, prevents SQL injection, caches queries,
 tracks costs, validates results, and benchmarks accuracy.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-latest-green)
-![Claude Haiku](https://img.shields.io/badge/Claude-Haiku_4.5-orange)
+![Gemini](https://img.shields.io/badge/Google-Gemini-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-latest-teal)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -28,11 +28,12 @@ Most text-to-SQL demos break on real databases. This one doesn't. Here's why:
 | 80-table enterprise schema overwhelms the LLM | `schema_index.py` — keyword scoring filters to top 12 relevant tables |
 | Cryptic column names (`cust_nm`, `ttl_amt`) cause hallucination | 70-entry abbreviation map translates column names before the LLM sees them |
 | Agent forgets `WHERE status = 'completed'`, returns wrong revenue | `validate_result` node — second LLM pass checks result plausibility |
+| Agent writes `sts_cd = 'completed'` but the data says `'COMP'` → 0 rows, no warning | **(added)** real code values shown in the prompt + `filter_check.py` / `zero_row_check` node retries once with the exact allowed values |
 | "What is total revenue?" — ambiguous, gets answered silently wrong | `disambiguate` node — documents the assumption made before generating SQL |
 | LLM writes `DELETE FROM customers` | `sql_guard.py` — deterministic SELECT-only enforcement |
 | Same question costs full LLM spend every time | `query_cache.py` — semantic fingerprint cache skips LLM on repeat queries |
 | No visibility into cost or token usage | `token_tracker.py` — per-node token tracking with prompt cache savings |
-| No way to know if a prompt change improved or regressed accuracy | `eval_harness.py` — 10-case benchmark with silent-wrong-answer detection |
+| No way to know if a prompt change improved or regressed accuracy | `eval_harness.py` — 10 business cases + **12 enterprise cases (added)**, with silent-wrong-answer detection |
 
 ---
 
@@ -41,17 +42,19 @@ User Question
 → cache_check       ─── (hit) ──────────────────────────→ END
 → schema_filter     ← keyword scoring + alias translation
 → disambiguate      ← auto-resolves ambiguous phrasing
-→ generate_sql      ← Claude Haiku with schema context
+→ generate_sql      ← Gemini with schema context + real column values
 → sql_guard         ─── (blocked) ──→ summarize → END
 → execute_sql
 ↕ (retry up to 2× with error feedback)
+→ zero_row_check    ← (added) 0 rows / count of 0? check filter values, retry once
 → validate_result   ← plausibility check
 → summarize
 → cache_store → END
 ---
 
 ## 📁 Project Structure
-├── agent.py              # LangGraph graph — all 9 nodes, 4 conditional edges
+├── agent.py              # LangGraph graph — 10 nodes, 5 conditional edges
+├── filter_check.py       # (added) finds filter values that don't exist in the data
 ├── schema_index.py       # Schema filtering + enterprise column alias translation
 ├── sql_guard.py          # Deterministic SELECT-only SQL safety enforcement
 ├── query_cache.py        # Semantic fingerprint query cache (SQLite-backed)
@@ -82,7 +85,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+# Edit .env and add your GOOGLE_API_KEY (free key: https://aistudio.google.com/apikey)
 ```
 
 ### 3. Seed the databases
@@ -160,9 +163,11 @@ This is the hardest failure mode — SQL executes without error, returns plausib
 ## 📊 Running the Eval Harness
 
 ```bash
-python eval_harness.py
+python eval_harness.py                       # business.db, 10 cases
+python eval_harness.py --db enterprise       # enterprise.db, 12 cases (added)
+python eval_harness.py --db enterprise --sleep 4 --save results/after.json --label "after fix"
 
-# Output:
+# Output (illustrative):
 # ✓ [B01] How many customers are in the database?
 # ✓ [B02] What are the top 3 product categories by total revenue?
 # ⚠ SILENT-WRONG [B02] What are the top 3... [Revenue includes cancelled orders]
@@ -202,8 +207,8 @@ curl http://localhost:8004/cost/report
 ## 🛠️ Tech Stack
 
 - **LangGraph** — agent graph with conditional routing and retry loops
-- **LangChain Anthropic** — Claude Haiku integration
-- **Claude Haiku 4.5** — SQL generation, disambiguation, validation, summarization
+- **LangChain Google GenAI** — Gemini integration
+- **Google Gemini (Flash-Lite)** — SQL generation, disambiguation, validation, summarization
 - **SQLAlchemy** — multi-database engine management
 - **FastAPI** — production API layer with Pydantic response models
 - **Gradio** — 7-tab demo UI
@@ -236,12 +241,14 @@ PRs welcome. If you find a question type the agent gets wrong, add it to `eval_h
 
 ---
 
-## 📄 License
+## 👤 Author
 
-MIT
+**Rangeesh** — adapted and maintained this version: Google Gemini backend, fix for silent 0-row results on coded data, an enterprise benchmark, and a redesigned UI. See [CHANGES.md](CHANGES.md) for exactly what changed from the original.
+
+Originally created by [sweta2503](https://github.com/sweta2503) — full credit for the original agent design.
 
 ---
 
-## 🔗 Related
+## 📄 License
 
-If you found this useful, check out my other AI engineering projects on this channel.
+MIT — see [LICENSE](LICENSE). The original copyright notice is retained as the license requires.

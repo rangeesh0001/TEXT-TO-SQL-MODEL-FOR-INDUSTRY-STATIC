@@ -159,6 +159,7 @@ class ColumnMeta:
     name: str
     col_type: str
     human_name: str = ""
+    values: list[str] = field(default_factory=list)   # real values for code columns
 
     def __post_init__(self):
         self.human_name = _humanise(self.name)
@@ -190,6 +191,9 @@ class TableMeta:
         lines.append("Columns:")
         for col in self.columns:
             annotation = f"  -- {col.human_name}" if include_human_names and col.human_name != col.name else ""
+            if col.values:
+                vals = ", ".join(f"'{v}'" for v in col.values)
+                annotation += f"{'; ' if annotation else '  -- '}values: {vals}"
             lines.append(f"  {col.name} ({col.col_type}){annotation}")
         if self.pk_columns:
             lines.append(f"Primary Key: {', '.join(self.pk_columns)}")
@@ -250,8 +254,10 @@ class SchemaIndex:
         return idx
 
     def _index_table(self, engine: Engine, inspector, tname: str, db_label: str):
+        from database import get_column_values
         columns = [
-            ColumnMeta(c["name"], str(c["type"]))
+            ColumnMeta(c["name"], str(c["type"]),
+                       values=get_column_values(engine, tname, c["name"], c["type"]))
             for c in inspector.get_columns(tname)
         ]
         pk = inspector.get_pk_constraint(tname).get("constrained_columns", [])

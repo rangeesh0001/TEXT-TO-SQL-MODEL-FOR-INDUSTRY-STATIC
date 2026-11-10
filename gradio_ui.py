@@ -15,6 +15,8 @@ import json
 import httpx
 import gradio as gr
 
+from token_tracker import estimate_cost
+
 API_BASE_URL = "http://localhost:8004"
 TIMEOUT = 300.0
 
@@ -82,7 +84,7 @@ def query_agent(question: str, db_name: str, chat_history: list):
     token_usage   = data.get("token_usage", {})
     total_in      = sum(v.get("input", 0) for v in token_usage.values())
     total_out     = sum(v.get("output", 0) for v in token_usage.values())
-    cost_usd      = (total_in * 0.80 + total_out * 4.00) / 1_000_000
+    cost_usd      = estimate_cost(total_in, total_out)   # Gemini rates from .env
 
     # Build assistant message
     badges = []
@@ -101,6 +103,9 @@ def query_agent(question: str, db_name: str, chat_history: list):
         bot += f"\n\n> 💡 **Assumption:** {note}"
     if warning:
         bot += f"\n\n> ⚠️ **Data quality warning:** {warning}"
+    zero_note = data.get("zero_row_note", "")
+    if zero_note.startswith("First attempt") and rows:
+        bot += "\n\n> 🔁 **Auto-corrected:** the first query used filter values that don't exist in the data; fixed and re-run."
     bot += f"\n\n*Latency: {latency:.0f} ms  |  Cost: ${cost_usd:.5f}*"
 
     chat_history = chat_history + [{"role": "assistant", "content": bot}]
@@ -308,28 +313,143 @@ def test_guard(sql_input: str):
 # Build UI
 # ---------------------------------------------------------------------------
 
-_THEME = gr.themes.Soft(
-    primary_hue="blue",
-    secondary_hue="slate",
-    neutral_hue="slate",
+# "Midnight Ledger" — dark ink surfaces, emerald accent, mono for data.
+# Same palette is applied to both light and dark modes so the look is
+# consistent regardless of the viewer's OS setting.
+_INK      = "#0b0f14"   # page background
+_PANEL    = "#11171f"   # blocks / cards
+_PANEL_2  = "#161e28"   # inputs, table rows
+_LINE     = "#223040"   # borders
+_TEXT     = "#e6edf3"
+_MUTED    = "#8b9aab"
+_ACCENT   = "#2dd4a7"   # emerald
+_ACCENT_D = "#1fae89"
+_WARN     = "#f5b14c"
+_DANGER   = "#f0616d"
+
+_THEME = gr.themes.Base(
+    primary_hue=gr.themes.colors.emerald,
+    secondary_hue=gr.themes.colors.slate,
+    neutral_hue=gr.themes.colors.slate,
+    radius_size=gr.themes.sizes.radius_md,
+    font=[gr.themes.GoogleFont("IBM Plex Sans"), "system-ui", "sans-serif"],
+    font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
 )
 
-_CSS = """
-    .container { max-width: 1300px; margin: auto; }
-    .sql-panel { font-family: monospace; background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 12px; }
-    .status-bar { font-size: 0.85em; padding: 4px 8px; border-radius: 4px; }
-    footer { display: none !important; }
+_theme_vars = dict(
+    body_background_fill=_INK,
+    body_text_color=_TEXT,
+    body_text_color_subdued=_MUTED,
+    background_fill_primary=_PANEL,
+    background_fill_secondary=_PANEL_2,
+    block_background_fill=_PANEL,
+    block_border_color=_LINE,
+    block_border_width="1px",
+    block_label_background_fill=_PANEL_2,
+    block_label_text_color=_MUTED,
+    block_title_text_color=_TEXT,
+    border_color_primary=_LINE,
+    border_color_accent=_ACCENT,
+    color_accent=_ACCENT,
+    color_accent_soft=_PANEL_2,
+    input_background_fill=_PANEL_2,
+    input_background_fill_focus=_PANEL_2,
+    input_border_color=_LINE,
+    input_border_color_focus=_ACCENT,
+    input_placeholder_color=_MUTED,
+    button_primary_background_fill=_ACCENT,
+    button_primary_background_fill_hover=_ACCENT_D,
+    button_primary_text_color=_INK,
+    button_primary_border_color=_ACCENT,
+    button_secondary_background_fill=_PANEL_2,
+    button_secondary_background_fill_hover=_LINE,
+    button_secondary_text_color=_TEXT,
+    button_secondary_border_color=_LINE,
+    button_cancel_background_fill=_DANGER,
+    button_cancel_background_fill_hover="#d94d59",
+    button_cancel_text_color=_INK,
+    table_even_background_fill=_PANEL,
+    table_odd_background_fill=_PANEL_2,
+    table_border_color=_LINE,
+    table_row_focus=_LINE,
+    code_background_fill="#0a0e13",
+    link_text_color=_ACCENT,
+    link_text_color_hover=_ACCENT_D,
+    slider_color=_ACCENT,
+    checkbox_background_color_selected=_ACCENT,
+    loader_color=_ACCENT,
+    shadow_drop="none",
+    shadow_drop_lg="none",
+)
+# Apply identical values to the *_dark variants (only where one exists)
+import inspect as _inspect
+_settable = set(_inspect.signature(_THEME.set).parameters)
+_dark_vars = {f"{k}_dark": v for k, v in _theme_vars.items() if f"{k}_dark" in _settable}
+_THEME = _THEME.set(**_theme_vars, **_dark_vars)
+
+_CSS = f"""
+    .gradio-container {{ max-width: 1320px !important; margin: auto; }}
+    footer {{ display: none !important; }}
+
+    /* Header */
+    #app-header {{
+        border: 1px solid {_LINE};
+        background: linear-gradient(135deg, {_PANEL} 0%, #0f1a1a 100%);
+        border-radius: 12px;
+        padding: 22px 26px;
+        margin-bottom: 8px;
+        display: flex; align-items: center; justify-content: space-between; gap: 16px;
+        flex-wrap: wrap;
+    }}
+    #app-header .title {{
+        font-size: 1.6em; font-weight: 600; letter-spacing: -0.01em; margin: 0; color: {_TEXT};
+    }}
+    #app-header .title .prompt {{ color: {_ACCENT}; font-family: 'JetBrains Mono', monospace; }}
+    #app-header .sub {{ color: {_MUTED}; margin: 6px 0 0; font-size: 0.98em; }}
+    #app-header .chips {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    #app-header .chip {{
+        font-family: 'JetBrains Mono', monospace; font-size: 0.78em;
+        padding: 4px 10px; border-radius: 999px;
+        border: 1px solid {_LINE}; color: {_MUTED}; background: {_PANEL_2};
+    }}
+    #app-header .chip.on {{ color: {_ACCENT}; border-color: {_ACCENT}33; }}
+
+    /* Tabs */
+    .tab-nav button, button[role="tab"] {{ color: {_MUTED} !important; font-weight: 500; }}
+    .tab-nav button.selected, button[role="tab"][aria-selected="true"] {{
+        color: {_ACCENT} !important; border-color: {_ACCENT} !important;
+    }}
+
+    /* Markdown headings inside tabs */
+    .prose h3, .md h3 {{ color: {_TEXT}; font-weight: 600; }}
+    .prose h4, .md h4 {{ color: {_MUTED}; font-weight: 500; text-transform: uppercase;
+                         letter-spacing: 0.06em; font-size: 0.8em; }}
+    .prose code, .md code {{ color: {_ACCENT}; background: {_PANEL_2}; }}
+    .prose blockquote, .md blockquote {{ border-left: 3px solid {_WARN}; color: {_TEXT}; }}
+
+    /* Chat bubbles */
+    .message.user, [data-testid="user"] {{ background: {_PANEL_2} !important; border: 1px solid {_LINE} !important; }}
+    .message.bot, [data-testid="bot"] {{ background: #0f1a17 !important; border: 1px solid {_ACCENT}33 !important; }}
+
+    /* Footer credit */
+    #app-credit {{ text-align: center; color: {_MUTED}; font-size: 0.82em; margin-top: 18px; }}
+    #app-credit a {{ color: {_ACCENT}; text-decoration: none; }}
 """
 
-with gr.Blocks(title="Text-to-SQL Agent — Production") as demo:
+with gr.Blocks(title="Text-to-SQL Agent — Rangeesh") as demo:
 
     gr.HTML("""
-        <div style="text-align: center; margin-bottom: 20px;">
-            <h1>🤖 Text-to-SQL AI Agent — Production</h1>
-            <p style="font-size: 1.1em;">
-                Ask natural language questions about your business data.<br>
-                Powered by <strong>Claude Haiku 4.5</strong> + <strong>LangGraph</strong> + <strong>SQLite</strong>
-            </p>
+        <div id="app-header">
+            <div>
+                <p class="title"><span class="prompt">&gt;_</span> Text-to-SQL AI Agent</p>
+                <p class="sub">Ask plain-English questions about your business data — get SQL, results and a summary.</p>
+            </div>
+            <div class="chips">
+                <span class="chip on">Gemini</span>
+                <span class="chip">LangGraph</span>
+                <span class="chip">FastAPI</span>
+                <span class="chip">SQLite</span>
+            </div>
         </div>
     """)
 
@@ -451,6 +571,8 @@ with gr.Blocks(title="Text-to-SQL Agent — Production") as demo:
                 page_info, data_rows, cols, stats = browse_table(
                     db_name, table_name, int(limit), int(offset)
                 )
+                if not cols:  # API offline / no table selected
+                    return page_info, stats, gr.Dataframe(value=[["—"]], headers=["(no data)"])
                 # Rebuild Dataframe with correct headers
                 df_update = gr.Dataframe(
                     value=data_rows,
@@ -611,7 +733,7 @@ with gr.Blocks(title="Text-to-SQL Agent — Production") as demo:
                 "Runs the ground-truth test suite and shows silent wrong answers."
             )
             with gr.Row():
-                eval_db  = gr.Dropdown(["business"], value="business", label="Database")
+                eval_db  = gr.Dropdown(["business", "enterprise"], value="business", label="Database")
                 eval_btn = gr.Button("▶ Run Evaluation", variant="primary")
             eval_summary = gr.Markdown("")
             eval_table   = gr.Dataframe(
@@ -651,6 +773,14 @@ with gr.Blocks(title="Text-to-SQL Agent — Production") as demo:
 
             guard_btn.click(fn=test_guard, inputs=[guard_input], outputs=[guard_out])
             guard_input.change(fn=test_guard, inputs=[guard_input], outputs=[guard_out])
+
+    gr.HTML("""
+        <div id="app-credit">
+            Maintained by <strong>Rangeesh</strong> ·
+            based on the open-source project by
+            <a href="https://github.com/sweta2503" target="_blank">sweta2503</a> (MIT License)
+        </div>
+    """)
 
 
 if __name__ == "__main__":

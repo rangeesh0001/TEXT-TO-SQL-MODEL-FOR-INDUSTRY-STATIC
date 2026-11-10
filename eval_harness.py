@@ -14,17 +14,34 @@ The question "What is total revenue?" has two plausible answers depending
 on whether you include cancelled orders — this test catches that bug.
 
 Usage:
-  python eval_harness.py                        # run full suite
-  python eval_harness.py --db enterprise        # run on enterprise schema
+  python eval_harness.py                        # business.db suite (10 cases)
+  python eval_harness.py --db enterprise        # enterprise.db suite (12 cases, added)
+  python eval_harness.py --db enterprise --save results/after.json --label "after fix"
+  python eval_harness.py --sleep 4              # pause between cases (Gemini free tier)
   python eval_harness.py --show-failures-only
+
+Added on top of the original:
+  - ENTERPRISE_DB_CASES: 12 cases on the 26-table enterprise.db, written to
+    hit code-value filters (COMP/GLD/NE), a lookup join, last-quarter dates and
+    one case where 0 rows IS the correct answer.
+  - match_ground_truth check: the agent's numbers must match the ground-truth
+    query's numbers (data is random per seed, so values are computed live).
+  - An unexpected 0-row result (ground truth has rows, agent returns none, no
+    error) now counts as a SILENT WRONG answer. The original only checked
+    silent-wrong answers when the agent returned rows.
+  - --db now actually runs the agent against that database (it used to always
+    query business.db), the query cache is cleared before each run so cached
+    answers don't hide regressions, and --save writes a JSON report.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -48,6 +65,8 @@ class EvalCase:
     # Silent-wrong-answer scenarios: extra query that must NOT match this one
     silent_wrong_sql: Optional[str] = None
     silent_wrong_description: Optional[str] = None
+    # Compare the agent's numbers with the ground-truth query's numbers (added)
+    match_ground_truth: bool = False
     tags: list[str] = field(default_factory=list)
     note: str = ""
 
@@ -218,6 +237,160 @@ BUSINESS_DB_CASES: list[EvalCase] = [
     ),
 ]
 
+
+# ---------------------------------------------------------------------------
+# Ground-truth test suite for the 26-table enterprise.db schema  (ADDED)
+# ---------------------------------------------------------------------------
+# Every case below needs the agent to map a human word to a stored code
+# (Completed -> 'COMP', Gold -> 'GLD', Northeast -> 'NE', Express -> 'EXP',
+# Defective -> 'DEF') or to anchor a date on ord_hdr.ord_dt. These are exactly
+# the places where the original agent returned 0 rows without any warning.
+
+ENTERPRISE_DB_CASES: list[EvalCase] = [
+    EvalCase(
+        id="E01",
+        question="How many orders have been completed?",
+        ground_truth_sql="SELECT COUNT(*) AS cnt FROM ord_hdr WHERE sts_cd = 'COMP'",
+        expected_row_count=1,
+        match_ground_truth=True,
+        silent_wrong_sql="SELECT COUNT(*) AS cnt FROM ord_hdr",
+        silent_wrong_description="Counted every order, not just completed ones",
+        tags=["code-value", "status"],
+        note="Status is stored as 'COMP', not 'completed'",
+    ),
+    EvalCase(
+        id="E02",
+        question="How many Gold tier customers do we have?",
+        ground_truth_sql="SELECT COUNT(*) AS cnt FROM cust_mstr WHERE tier_cd = 'GLD'",
+        expected_row_count=1,
+        match_ground_truth=True,
+        tags=["code-value", "tier"],
+        note="Tier is stored as 'GLD', not 'Gold'",
+    ),
+    EvalCase(
+        id="E03",
+        question="How many customers are there in each region? Show the region name.",
+        ground_truth_sql="""
+            SELECT r.rgn_nm, COUNT(*) AS cust_count
+            FROM cust_mstr c JOIN rgn_lkp r ON c.rgn_cd = r.rgn_cd
+            GROUP BY r.rgn_nm ORDER BY cust_count DESC
+        """,
+        expected_row_count=6,
+        tags=["lookup-join", "group-by"],
+        note="Region names live in rgn_lkp, not cust_mstr",
+    ),
+    EvalCase(
+        id="E04",
+        question="What is the total revenue from completed orders placed by customers in the Northeast region?",
+        ground_truth_sql="""
+            SELECT ROUND(SUM(o.ttl_amt), 2) AS revenue
+            FROM ord_hdr o JOIN cust_mstr c ON o.cust_id = c.cust_id
+            WHERE o.sts_cd = 'COMP' AND c.rgn_cd = 'NE'
+        """,
+        expected_row_count=1,
+        match_ground_truth=True,
+        silent_wrong_sql="""
+            SELECT ROUND(SUM(o.ttl_amt), 2) AS revenue
+            FROM ord_hdr o JOIN cust_mstr c ON o.cust_id = c.cust_id
+            WHERE c.rgn_cd = 'NE'
+        """,
+        silent_wrong_description="Revenue includes cancelled/processing orders",
+        tags=["code-value", "join", "two-filters"],
+    ),
+    EvalCase(
+        id="E05",
+        question="How many orders were cancelled in 2024?",
+        ground_truth_sql="""
+            SELECT COUNT(*) AS cnt FROM ord_hdr
+            WHERE sts_cd = 'CANC' AND ord_dt >= '2024-01-01' AND ord_dt < '2025-01-01'
+        """,
+        expected_row_count=1,
+        match_ground_truth=True,
+        tags=["code-value", "date-filter"],
+    ),
+    EvalCase(
+        id="E06",
+        question="What is the total value of completed orders from Platinum customers?",
+        ground_truth_sql="""
+            SELECT ROUND(SUM(o.ttl_amt), 2) AS revenue
+            FROM ord_hdr o JOIN cust_mstr c ON o.cust_id = c.cust_id
+            WHERE c.tier_cd = 'PLT' AND o.sts_cd = 'COMP'
+        """,
+        expected_row_count=1,
+        match_ground_truth=True,
+        tags=["code-value", "join", "two-filters"],
+    ),
+    EvalCase(
+        id="E07",
+        question="What is the total outstanding balance on open invoices?",
+        ground_truth_sql="SELECT ROUND(SUM(bal_amt), 2) AS open_balance FROM ar_hdr WHERE sts_cd = 'OPEN'",
+        expected_row_count=1,
+        match_ground_truth=True,
+        tags=["code-value", "finance"],
+        note="Invoices are in ar_hdr; ord_hdr also has an sts_cd column with different codes",
+    ),
+    EvalCase(
+        id="E08",
+        question="What are the top 3 product categories by revenue from completed orders?",
+        ground_truth_sql="""
+            SELECT p.cat_cd, ROUND(SUM(d.ext_amt), 2) AS revenue
+            FROM ord_dtl d
+            JOIN ord_hdr o ON d.ord_id = o.ord_id
+            JOIN prd_mstr p ON d.prd_id = p.prd_id
+            WHERE o.sts_cd = 'COMP'
+            GROUP BY p.cat_cd ORDER BY revenue DESC LIMIT 3
+        """,
+        expected_row_count=3,
+        match_ground_truth=True,
+        tags=["code-value", "3-way-join", "top-n"],
+    ),
+    EvalCase(
+        id="E09",
+        question="How many orders were shipped using the Express 2-Day method?",
+        ground_truth_sql="SELECT COUNT(*) AS cnt FROM ord_hdr WHERE shp_mth_cd = 'EXP'",
+        expected_row_count=1,
+        match_ground_truth=True,
+        tags=["code-value", "lookup"],
+    ),
+    EvalCase(
+        id="E10",
+        question="Which customers have an address in Canada?",
+        ground_truth_sql="""
+            SELECT c.cust_nm FROM cust_mstr c
+            JOIN cust_addr a ON c.cust_id = a.cust_id
+            WHERE a.ctry_cd = 'CA'
+        """,
+        expected_row_count=0,
+        tags=["correct-empty"],
+        note="0 rows IS the right answer — the agent must not 'fix' this into a wrong country",
+    ),
+    EvalCase(
+        id="E11",
+        question="How many completed orders were placed last quarter?",
+        ground_truth_sql="""
+            SELECT COUNT(*) AS cnt FROM ord_hdr
+            WHERE sts_cd = 'COMP' AND ord_dt BETWEEN '2024-01-01' AND '2024-03-31'
+        """,
+        expected_row_count=1,
+        match_ground_truth=True,
+        tags=["relative-date", "code-value"],
+        note="Data ends in June 2024, so 'last quarter' = Jan–Mar 2024 (needs the enterprise date anchor)",
+    ),
+    EvalCase(
+        id="E12",
+        question="How many returns were due to defective products?",
+        ground_truth_sql="SELECT COUNT(*) AS cnt FROM rtns_hdr WHERE rsn_cd = 'DEF'",
+        expected_row_count=1,
+        match_ground_truth=True,
+        tags=["code-value", "returns"],
+    ),
+]
+
+CASES_BY_DB: dict[str, list[EvalCase]] = {
+    "business": BUSINESS_DB_CASES,
+    "enterprise": ENTERPRISE_DB_CASES,
+}
+
 # ---------------------------------------------------------------------------
 # Ambiguity test cases (Gap 7 demo)
 # ---------------------------------------------------------------------------
@@ -270,6 +443,8 @@ class TestResult:
     error: Optional[str]
     latency_ms: float
     checks: dict[str, bool]
+    silent_reason: Optional[str] = None
+    zero_row_retried: bool = False
 
 
 def _run_sql(engine, sql: str) -> list[dict]:
@@ -288,6 +463,41 @@ def _values_match(actual: Any, expected: Any, tol: float) -> bool:
         return str(actual).strip() == str(expected).strip()
 
 
+def _looks_empty(rows: list[dict]) -> bool:
+    """0 rows, or one row of only 0/NULL (what COUNT/SUM return when nothing matches)."""
+    if not rows:
+        return True
+    if len(rows) == 1:
+        vals = list(rows[0].values())
+        return bool(vals) and all(v is None or (isinstance(v, (int, float)) and v == 0) for v in vals)
+    return False
+
+
+def _numbers(row: dict) -> list[float]:
+    out = []
+    for v in row.values():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out.append(float(v))
+    return out
+
+
+def _matches_ground_truth(agent_rows: list[dict], gt_rows: list[dict], tol: float = 0.01) -> bool:
+    """Every number in the ground truth's first row must appear in the agent's first row.
+
+    Column names and order don't matter (the agent may alias 'cnt' as 'total'),
+    only the values do.
+    """
+    if not gt_rows:
+        return not agent_rows
+    if not agent_rows:
+        return False
+    agent_nums = _numbers(agent_rows[0])
+    for expected in _numbers(gt_rows[0]):
+        if not any(_values_match(a, expected, tol) for a in agent_nums):
+            return False
+    return True
+
+
 def evaluate(
     agent_fn: Callable[[str], dict],
     cases: list[EvalCase],
@@ -299,6 +509,7 @@ def evaluate(
     for case in cases:
         gt_result = _run_sql(engine, case.ground_truth_sql)
         start = time.time()
+        agent_out: dict = {}
         try:
             agent_out = agent_fn(case.question)
             latency_ms = (time.time() - start) * 1000
@@ -327,8 +538,19 @@ def evaluate(
             actual_val = agent_result[0].get(case.expected_col)
             checks["value_match"] = _values_match(actual_val, case.expected_value, case.expected_value_tolerance)
 
+        # Check 3b (added): numbers match the ground-truth query
+        if case.match_ground_truth:
+            checks["matches_ground_truth"] = _matches_ground_truth(agent_result, gt_result)
+
         # Check 4: silent wrong answer — did agent match the WRONG query's output instead?
         silent_wrong = False
+        silent_reason = case.silent_wrong_description
+        # Check 4b (added): ran without error but returned 0 rows when the
+        # right answer has rows. The original never flagged this case.
+        if not _looks_empty(gt_result) and _looks_empty(agent_result) and agent_error is None:
+            silent_wrong = True
+            silent_reason = ("Query ran without error but found no matching data "
+                             "(0 rows or a count of 0) — likely a wrong filter value")
         if case.silent_wrong_sql and agent_result:
             wrong_result = _run_sql(engine, case.silent_wrong_sql)
             # If agent result matches wrong_result (by row count + first values) but NOT gt_result
@@ -337,7 +559,8 @@ def evaluate(
                     first_wrong = list(wrong_result[0].values())
                     first_agent = list(agent_result[0].values())
                     if first_wrong and first_agent:
-                        silent_wrong = _values_match(first_agent[0], first_wrong[0], 0.01)
+                        if _values_match(first_agent[0], first_wrong[0], 0.01):
+                            silent_wrong = True
 
         passed = all(checks.values()) and checks.get("no_error", False) and not silent_wrong
         results.append(TestResult(
@@ -351,6 +574,8 @@ def evaluate(
             error=agent_error,
             latency_ms=latency_ms,
             checks=checks,
+            silent_reason=silent_reason if silent_wrong else None,
+            zero_row_retried=str(agent_out.get("zero_row_note") or "").startswith("First attempt"),
         ))
 
         if verbose:
@@ -361,7 +586,8 @@ def evaluate(
                 print(f"        Error: {agent_error}" if agent_error else "")
                 print(f"        Checks: {checks}")
                 if silent_wrong:
-                    print(f"        Silent wrong: {case.silent_wrong_description}")
+                    print(f"        Silent wrong: {silent_reason}")
+                print(f"        SQL: {agent_sql[:160]}")
 
     return results
 
@@ -388,7 +614,41 @@ def print_report(results: list[TestResult]) -> None:
         print("\n  ⚠ SILENT WRONG ANSWERS (most dangerous failure mode):")
         for r in results:
             if r.silent_wrong:
-                print(f"    [{r.case_id}] {r.question}")
+                print(f"    [{r.case_id}] {r.question}  — {r.silent_reason}")
+
+
+def save_report(results: list[TestResult], path: str, db_name: str, label: str) -> None:
+    """Write a JSON report so before/after runs can be compared."""
+    from token_tracker import INPUT_COST_PER_MTOK, OUTPUT_COST_PER_MTOK
+    total = len(results)
+    passed = sum(1 for r in results if r.passed)
+    report = {
+        "label": label,
+        "db": db_name,
+        "model": os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest"),
+        "run_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total": total,
+        "passed": passed,
+        "pass_rate_pct": round(100 * passed / max(total, 1), 1),
+        "silent_wrong": sum(1 for r in results if r.silent_wrong),
+        "errors": sum(1 for r in results if r.error),
+        "zero_row_retries": sum(1 for r in results if r.zero_row_retried),
+        "avg_latency_ms": round(sum(r.latency_ms for r in results) / max(total, 1)),
+        "price_per_mtok": {"input": INPUT_COST_PER_MTOK, "output": OUTPUT_COST_PER_MTOK},
+        "cases": [
+            {
+                "id": r.case_id, "question": r.question, "passed": r.passed,
+                "silent_wrong": r.silent_wrong, "silent_reason": r.silent_reason,
+                "error": r.error, "checks": r.checks, "agent_sql": r.agent_sql,
+                "agent_rows": len(r.agent_result), "expected_rows": len(r.ground_truth_result),
+                "zero_row_retried": r.zero_row_retried, "latency_ms": round(r.latency_ms),
+            }
+            for r in results
+        ],
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(report, indent=2, default=str))
+    print(f"\n  Saved report → {path}")
 
 
 def print_ambiguity_demo(engine) -> None:
@@ -427,6 +687,12 @@ if __name__ == "__main__":
     parser.add_argument("--db", default="business", choices=["business", "enterprise"])
     parser.add_argument("--show-failures-only", action="store_true")
     parser.add_argument("--ambiguity-demo", action="store_true", default=True)
+    parser.add_argument("--save", help="write a JSON report here, e.g. results/after.json")
+    parser.add_argument("--label", default="", help="name for this run in the saved report")
+    parser.add_argument("--sleep", type=float, default=0.0,
+                        help="seconds to wait between cases (avoids Gemini free-tier rate limits)")
+    parser.add_argument("--keep-cache", action="store_true",
+                        help="don't clear the query cache first (default: clear it)")
     args = parser.parse_args()
 
     db_path = "business.db" if args.db == "business" else "enterprise.db"
@@ -439,12 +705,24 @@ if __name__ == "__main__":
         print(f"Could not import agent: {e}")
         sys.exit(1)
 
-    print(f"\nRunning evaluation on {db_path}...")
+    if not args.keep_cache:
+        from query_cache import clear_all
+        clear_all()   # otherwise repeat runs replay cached SQL and hide changes
+
+    cases = CASES_BY_DB[args.db]
+
+    def _agent(q: str) -> dict:
+        out = run_agent(q, db_name=args.db)
+        if args.sleep:
+            time.sleep(args.sleep)
+        return out
+
+    print(f"\nRunning {len(cases)} cases on {db_path}...")
     print("-" * 65)
 
     results = evaluate(
-        agent_fn=run_agent,
-        cases=BUSINESS_DB_CASES,
+        agent_fn=_agent,
+        cases=cases,
         engine=engine,
         verbose=not args.show_failures_only,
     )
@@ -459,5 +737,8 @@ if __name__ == "__main__":
 
     print_report(results)
 
-    if args.ambiguity_demo:
+    if args.save:
+        save_report(results, args.save, args.db, args.label)
+
+    if args.ambiguity_demo and args.db == "business":
         print_ambiguity_demo(engine)

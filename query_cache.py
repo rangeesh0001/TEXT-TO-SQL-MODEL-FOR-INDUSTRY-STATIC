@@ -28,11 +28,16 @@ _STOPWORDS = frozenset(
 )
 
 
-def _fingerprint(question: str) -> str:
-    """Normalise a question to a stable hash for cache lookups."""
+def _fingerprint(question: str, db_name: str = "business") -> str:
+    """Normalise a question to a stable hash for cache lookups.
+
+    The database name is part of the key: the same question asked of
+    business.db and enterprise.db needs different SQL, so they must never
+    share a cache entry.
+    """
     tokens = re.sub(r"[^a-z0-9 ]", " ", question.lower()).split()
     meaningful = sorted(t for t in tokens if t not in _STOPWORDS and len(t) > 1)
-    key = " ".join(meaningful)
+    key = f"{db_name}|" + " ".join(meaningful)
     return hashlib.md5(key.encode()).hexdigest()
 
 
@@ -68,14 +73,15 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-def get(question: str) -> Optional[CacheEntry]:
-    """Return a cached entry if one exists for this question, else None."""
-    fp = _fingerprint(question)
+def get(question: str, db_name: str = "business") -> Optional[CacheEntry]:
+    """Return a cached entry if one exists for this question on this database, else None."""
+    fp = _fingerprint(question, db_name)
     conn = _get_conn()
     row = conn.execute(
         "SELECT * FROM query_cache WHERE fingerprint = ?", (fp,)
     ).fetchone()
     if row is None:
+        conn.close()
         return None
 
     # Bump hit counter
@@ -97,9 +103,10 @@ def put(
     summary: str,
     row_count: int = 0,
     token_cost_usd: float = 0.0,
+    db_name: str = "business",
 ) -> str:
     """Store a new entry and return its fingerprint."""
-    fp = _fingerprint(question)
+    fp = _fingerprint(question, db_name)
     now = time.time()
     conn = _get_conn()
     conn.execute(
@@ -114,9 +121,9 @@ def put(
     return fp
 
 
-def invalidate(question: str) -> bool:
+def invalidate(question: str, db_name: str = "business") -> bool:
     """Remove a single entry from the cache. Returns True if it existed."""
-    fp = _fingerprint(question)
+    fp = _fingerprint(question, db_name)
     conn = _get_conn()
     deleted = conn.execute("DELETE FROM query_cache WHERE fingerprint = ?", (fp,)).rowcount
     conn.commit()

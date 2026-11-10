@@ -2,9 +2,8 @@ fastapi
 uvicorn
 langgraph
 langchain
-langchain-anthropic
+langchain-google-genai
 langchain-community
-anthropic
 sqlalchemy
 gradio
 python-dotenv

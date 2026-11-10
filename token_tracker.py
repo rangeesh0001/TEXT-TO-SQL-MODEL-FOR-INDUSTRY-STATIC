@@ -2,26 +2,40 @@
 token_tracker.py — Gap 8: Track token spend per query, estimate cost, show
 how schema caching cuts cost on repeat questions.
 
-Haiku 4.5 pricing (as of 2025): $0.80 / MTok input, $4.00 / MTok output.
-Prompt cache read: $0.08 / MTok  (10× cheaper than uncached input).
+Pricing is read from .env so it matches whichever model the agent uses.
+Defaults are Google's paid-tier list price for Gemini 3.5 Flash-Lite
+($0.30 / MTok input, $2.50 / MTok output; ai.google.dev/gemini-api/docs/pricing).
+On the free tier the real bill is $0 — figures are "what this would cost on
+the paid tier". Update the .env values if you change GEMINI_MODEL.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()   # so pricing from .env is picked up even when imported by gradio_ui
+
 # ---------------------------------------------------------------------------
 # Pricing (per million tokens)
 # ---------------------------------------------------------------------------
-INPUT_COST_PER_MTOK = 0.80
-OUTPUT_COST_PER_MTOK = 4.00
-CACHE_READ_PER_MTOK = 0.08       # prompt cache hit
-CACHE_WRITE_PER_MTOK = 1.00      # first-write surcharge (amortised across hits)
+INPUT_COST_PER_MTOK = float(os.getenv("LLM_INPUT_COST_PER_MTOK", "0.30"))
+OUTPUT_COST_PER_MTOK = float(os.getenv("LLM_OUTPUT_COST_PER_MTOK", "2.50"))
+# Prompt caching is Anthropic-specific; Gemini via LangChain reports none,
+# so these only matter if you switch back to a provider that reports it.
+CACHE_READ_PER_MTOK = float(os.getenv("LLM_CACHE_READ_PER_MTOK", "0.0"))
+CACHE_WRITE_PER_MTOK = float(os.getenv("LLM_CACHE_WRITE_PER_MTOK", "0.0"))
+
+
+def estimate_cost(input_tokens: int, output_tokens: int) -> float:
+    """Single place that turns token counts into dollars (used by agent + UI)."""
+    return (input_tokens * INPUT_COST_PER_MTOK + output_tokens * OUTPUT_COST_PER_MTOK) / 1_000_000
 
 _STORE_PATH = Path(__file__).parent / "token_log.db"
 
