@@ -8,6 +8,8 @@ New nodes vs the demo version:
   generate_sql   → (existing, updated for prompt caching)
   sql_guard      → Gap 5: block non-SELECT before execution
   execute_sql    → (existing)
+  zero_row_check → ADDED: if a query returns 0 rows, check its filter values
+                   against the real data and retry once with precise feedback
   validate_result→ Gap 3: detect silently wrong numbers
   summarize      → (existing, updated with warnings + token tracking)
   cache_store    → Gap 4: persist result to cache
@@ -20,7 +22,8 @@ Graph flow:
     → generate_sql
     → sql_guard ──(blocked)──→ summarize → END
     → execute_sql
-    ↕ (retry up to 2×)
+    ↕ (retry up to 2× on SQL errors)
+    → zero_row_check ──(bad filter value)──→ generate_sql (once)
     → validate_result
     → summarize
     → cache_store → END
@@ -38,16 +41,19 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
-from database import get_schema_string, execute_sql, get_engine
+from database import get_schema_string, execute_sql, get_engine, get_value_map
+from filter_check import find_filter_mismatches
 from schema_index import SchemaIndex
 from sql_guard import check_sql
 from query_cache import get as cache_get, put as cache_put
-from token_tracker import QueryUsage, PhaseUsage, extract_usage, log_usage
+from token_tracker import QueryUsage, PhaseUsage, extract_usage, log_usage, estimate_cost
 
 load_dotenv(override=True)
 
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+
 llm = ChatGoogleGenerativeAI(
-    model="gemini-flash-lite-latest",
+    model=GEMINI_MODEL,
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     max_tokens=1024,
     temperature=0,
@@ -93,6 +99,10 @@ class AgentState(TypedDict):
     schema_was_cached: bool
     token_usage: dict
     latency_ms: float
+    # 0-row check (added)
+    zero_row_retry: int          # 0 = not used yet, 1 = already checked once
+    zero_row_feedback: str       # what was wrong with the filters, sent to the LLM
+    zero_row_note: str           # shown to the user when 0 rows remain
 
 
 def _initial_state(question: str, db_name: str = "business") -> AgentState:
@@ -115,6 +125,9 @@ def _initial_state(question: str, db_name: str = "business") -> AgentState:
         schema_was_cached=False,
         token_usage={},
         latency_ms=0.0,
+        zero_row_retry=0,
+        zero_row_feedback="",
+        zero_row_note="",
     )
 
 
@@ -123,7 +136,7 @@ def _initial_state(question: str, db_name: str = "business") -> AgentState:
 # ---------------------------------------------------------------------------
 
 def cache_check_node(state: AgentState) -> AgentState:
-    entry = cache_get(state["question"])
+    entry = cache_get(state["question"], state["db_name"])
     if entry is None:
         return state
     # Re-execute the cached SQL so callers always get fresh result rows
@@ -131,7 +144,9 @@ def cache_check_node(state: AgentState) -> AgentState:
     try:
         fresh_rows = execute_sql(entry.sql_query, state["db_name"])
     except Exception:
-        fresh_rows = []
+        # Cached SQL no longer runs (schema changed, etc.) — treat as a miss
+        # instead of silently returning 0 rows with an old summary.
+        return state
     return {
         **state,
         "cached": True,
@@ -246,11 +261,24 @@ Rules:
   so use BETWEEN '2024-01-01' AND '2024-03-31' with explicit literals derived from the max date"""
 
 
+# Which table/column holds the main business date in each database.
+# Originally hard-coded to orders.order_date, which does not exist in
+# enterprise.db — so "last quarter" had no anchor there.
+_DATE_ANCHOR = {
+    "business": ("orders", "order_date"),
+    "enterprise": ("ord_hdr", "ord_dt"),
+}
+
+
 def _get_date_range(db_name: str) -> str:
-    """Return a note about the actual date range in the orders table, if available."""
+    """Return a note about the actual date range of the main orders table, if available."""
+    anchor = _DATE_ANCHOR.get(db_name)
+    if not anchor:
+        return ""
+    table, col = anchor
     try:
         rows = execute_sql(
-            "SELECT MIN(order_date) AS min_d, MAX(order_date) AS max_d FROM orders", db_name
+            f"SELECT MIN({col}) AS min_d, MAX({col}) AS max_d FROM {table}", db_name
         )
         if rows and rows[0].get("min_d"):
             from datetime import date
@@ -269,7 +297,7 @@ def _get_date_range(db_name: str) -> str:
                 lq_end = date(max_date.year, lq_end_month,
                               calendar.monthrange(max_date.year, lq_end_month)[1])
             return (
-                f"Data date range: {min_d} to {max_d}. "
+                f"Data date range ({table}.{col}): {min_d} to {max_d}. "
                 f"Treat {max_d} as 'today'. "
                 f"'Last quarter' = {lq_start} to {lq_end}. "
                 f"Use BETWEEN '{lq_start}' AND '{lq_end}' for last-quarter filters."
@@ -290,7 +318,23 @@ def generate_sql_node(state: AgentState) -> AgentState:
     date_range = _get_date_range(state["db_name"])
     date_block = f"\n{date_range}\n" if date_range else ""
 
-    if error and retry_count > 0:
+    zero_feedback = state.get("zero_row_feedback", "")
+
+    if zero_feedback:
+        user_prompt = f"""Schema:
+{schema}
+{date_block}
+Question: {question}{assumption_block}
+
+Previous SQL (ran without error but returned 0 rows):
+{state.get('sql_query', '')}
+
+Problem found by checking the data:
+{zero_feedback}
+
+Rewrite the query using the exact values that exist in the data.
+Return only the corrected SELECT query:"""
+    elif error and retry_count > 0:
         user_prompt = f"""Schema:
 {schema}
 {date_block}
@@ -317,11 +361,11 @@ Write a SQLite SELECT query:"""
 
     usage = state.get("token_usage", {})
     in_t, out_t, cr_t, cw_t = extract_usage(response)
-    usage[f"generate_sql_attempt_{retry_count}"] = {
-        "input": in_t, "output": out_t, "cache_read": cr_t,
-    }
+    phase = "generate_sql_zero_row_retry" if zero_feedback else f"generate_sql_attempt_{retry_count}"
+    usage[phase] = {"input": in_t, "output": out_t, "cache_read": cr_t}
 
-    return {**state, "sql_query": sql, "error": "", "sql_result": [], "token_usage": usage}
+    return {**state, "sql_query": sql, "error": "", "sql_result": [],
+            "token_usage": usage, "zero_row_feedback": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -360,12 +404,65 @@ def execute_sql_node(state: AgentState) -> AgentState:
         return {**state, "sql_result": [], "error": str(e)}
 
 
+def looks_empty(rows: list) -> bool:
+    """True for 0 rows, and for a single row of only 0/NULL values.
+
+    A wrong filter in COUNT(*) or SUM() doesn't return 0 rows — it returns one
+    row saying 0 (or NULL). That is the same silent failure, just disguised as
+    a confident answer, so it gets the same check.
+    """
+    if not rows:
+        return True
+    if len(rows) == 1:
+        vals = list(rows[0].values())
+        return bool(vals) and all(v is None or (isinstance(v, (int, float)) and v == 0) for v in vals)
+    return False
+
+
 def _after_execute(state: AgentState) -> str:
     error = state.get("error", "")
     retry = state.get("retry_count", 0)
     if error and retry < 2:
         return "handle_error"
+    if not error and looks_empty(state.get("sql_result", [])) and state.get("zero_row_retry", 0) == 0:
+        return "zero_row_check"
     return "validate_result"
+
+
+# ---------------------------------------------------------------------------
+# Node 6b: zero_row_check — ADDED (silent 0-row results)
+# ---------------------------------------------------------------------------
+
+def zero_row_check_node(state: AgentState) -> AgentState:
+    """The query ran but returned nothing. Was that real, or a wrong filter value?"""
+    try:
+        value_map = get_value_map(state["db_name"])
+    except Exception:
+        value_map = {}
+    mismatches = find_filter_mismatches(state["sql_query"], value_map)
+
+    if not mismatches:
+        # Every filter value exists in the data, so 0 rows is probably a real
+        # answer ("no customers in Canada"). Don't spend another LLM call.
+        return {
+            **state,
+            "zero_row_retry": 1,
+            "zero_row_note": "The query returned no matching data (0 rows, or a count/total of 0). "
+                             "All filter values exist in the data, so this is likely a genuine empty result.",
+        }
+
+    feedback = "\n".join(f"- {m.describe()}" for m in mismatches)
+    return {
+        **state,
+        "zero_row_retry": 1,
+        "zero_row_feedback": feedback,
+        "zero_row_note": "First attempt returned no matching data because of filter values not in the data:\n"
+                         + feedback,
+    }
+
+
+def _after_zero_row_check(state: AgentState) -> str:
+    return "retry" if state.get("zero_row_feedback") else "validate_result"
 
 
 def handle_error_node(state: AgentState) -> AgentState:
@@ -384,8 +481,16 @@ Reply with VALID if the result looks correct, or WARNING: <brief reason> if susp
 
 def validate_result_node(state: AgentState) -> AgentState:
     result = state.get("sql_result", [])
-    if not result:
-        return {**state, "validation_warning": ""}
+    if looks_empty(result):
+        # Originally returned no warning for 0 rows, so they looked valid.
+        if state.get("error"):
+            return {**state, "validation_warning": ""}
+        note = state.get("zero_row_note", "")
+        if note.startswith("First attempt"):
+            warning = "Still no matching data after correcting the filter values — check the question's filters."
+        else:
+            warning = note or "The query returned no matching data."
+        return {**state, "validation_warning": warning}
 
     preview = result[:5]
     messages = [
@@ -464,15 +569,19 @@ def cache_store_node(state: AgentState) -> AgentState:
     # Estimate total cost from token_usage
     total_input = sum(v.get("input", 0) for v in state["token_usage"].values())
     total_output = sum(v.get("output", 0) for v in state["token_usage"].values())
-    cost = (total_input * 0.80 + total_output * 4.00) / 1_000_000
+    cost = estimate_cost(total_input, total_output)
 
-    cache_put(
-        question=state["question"],
-        sql_query=state["sql_query"],
-        summary=state["summary"],
-        row_count=len(state.get("sql_result", [])),
-        token_cost_usd=cost,
-    )
+    # Don't cache empty results: a 0-row answer might be a mistake, and caching
+    # it would replay the same mistake on every repeat of the question.
+    if not looks_empty(state.get("sql_result", [])):
+        cache_put(
+            question=state["question"],
+            sql_query=state["sql_query"],
+            summary=state["summary"],
+            row_count=len(state.get("sql_result", [])),
+            token_cost_usd=cost,
+            db_name=state["db_name"],
+        )
 
     # Persist to token log
     qu = QueryUsage(question=state["question"], schema_was_cached=state["schema_was_cached"])
@@ -501,6 +610,7 @@ workflow.add_node("generate_sql", generate_sql_node)
 workflow.add_node("sql_guard", sql_guard_node)
 workflow.add_node("execute_sql", execute_sql_node)
 workflow.add_node("handle_error", handle_error_node)
+workflow.add_node("zero_row_check", zero_row_check_node)
 workflow.add_node("validate_result", validate_result_node)
 workflow.add_node("summarize", summarize_node)
 workflow.add_node("cache_store", cache_store_node)
@@ -526,7 +636,14 @@ workflow.add_conditional_edges(
 workflow.add_conditional_edges(
     "execute_sql",
     _after_execute,
-    {"handle_error": "handle_error", "validate_result": "validate_result"},
+    {"handle_error": "handle_error", "zero_row_check": "zero_row_check",
+     "validate_result": "validate_result"},
+)
+
+workflow.add_conditional_edges(
+    "zero_row_check",
+    _after_zero_row_check,
+    {"retry": "generate_sql", "validate_result": "validate_result"},
 )
 
 workflow.add_edge("handle_error", "generate_sql")
@@ -564,6 +681,7 @@ def run_agent(question: str, db_name: str = "business") -> dict:
         "schema_was_cached": final["schema_was_cached"],
         "token_usage": final["token_usage"],
         "latency_ms": latency,
+        "zero_row_note": final.get("zero_row_note", ""),
     }
 
 

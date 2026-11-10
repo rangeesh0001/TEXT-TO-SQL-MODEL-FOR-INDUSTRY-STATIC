@@ -41,7 +41,7 @@ from token_tracker import get_cost_report
 
 app = FastAPI(
     title="Text-to-SQL Agent API",
-    description="Production-grade natural language to SQL agent — LangGraph + Claude",
+    description="Production-grade natural language to SQL agent — LangGraph + Gemini",
     version="2.0.0",
 )
 
@@ -89,6 +89,7 @@ class QueryResponse(BaseModel):
     schema_was_cached: bool = False
     token_usage: dict = {}
     latency_ms: float = 0.0
+    zero_row_note: str = ""
 
 
 class ExportRequest(BaseModel):
@@ -240,14 +241,18 @@ async def run_evaluation(db_name: str = "business"):
     """
     try:
         from sqlalchemy import create_engine as _ce
-        from eval_harness import BUSINESS_DB_CASES, evaluate
+        from eval_harness import CASES_BY_DB, evaluate
+        from query_cache import clear_all
+        if db_name not in CASES_BY_DB:
+            raise HTTPException(status_code=400, detail=f"No eval cases for {db_name!r}")
+        clear_all()   # cached answers would hide regressions
 
         eng = _ce(f"sqlite:///{db_name}.db", connect_args={"check_same_thread": False})
 
         def _agent(q: str) -> dict:
             return run_agent(q, db_name=db_name)
 
-        results = evaluate(agent_fn=_agent, cases=BUSINESS_DB_CASES, engine=eng, verbose=False)
+        results = evaluate(agent_fn=_agent, cases=CASES_BY_DB[db_name], engine=eng, verbose=False)
         total = len(results)
         passed = sum(1 for r in results if r.passed)
         return {
@@ -262,6 +267,7 @@ async def run_evaluation(db_name: str = "business"):
                     "question": r.question,
                     "passed": r.passed,
                     "silent_wrong": r.silent_wrong,
+                    "silent_reason": r.silent_reason,
                     "error": r.error,
                     "checks": r.checks,
                     "latency_ms": round(r.latency_ms),
